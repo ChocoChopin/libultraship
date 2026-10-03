@@ -28,6 +28,7 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/TlutCopy.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
@@ -2516,28 +2517,48 @@ void Interpreter::GfxDpLoadTlut(uint8_t tile, uint32_t high_index) {
     uint32_t byteCount = entryCount * 2;
 
     if (tmem >= 256) {
+        const auto& resource = mRdp->texture_to_load.raw_tex_metadata.resource;
+        TlutResourceSpan resourceSpan{};
+        if (resource != nullptr) {
+            resourceSpan.imageData = resource->ImageData;
+            resourceSpan.imageBytes = resource->ImageDataSize;
+            resourceSpan.hasOwnedBuffer = resource->mImageBuffer != nullptr;
+            if (resourceSpan.hasOwnedBuffer) {
+                resourceSpan.ownedBufferData = reinterpret_cast<const uint8_t*>(resource->mImageBuffer->data());
+                resourceSpan.ownedBufferBytes = resource->mImageBuffer->size();
+            }
+        }
+        const auto copyPalette = [&](uint8_t* destination, size_t requestedBytes, size_t sourceOffset) {
+            if (resource != nullptr) {
+                CopyTlutResourceBytes(destination, requestedBytes, src, sourceOffset, resourceSpan);
+            } else {
+                // Raw display-list callers do not provide a resource extent.
+                memcpy(destination, src + sourceOffset, requestedBytes);
+            }
+        };
+
         // N64 TMEM palette area starts at tmem word 256. Each CI4 palette = 16 entries = 16 tmem words.
         uint32_t paletteByteOffset = (tmem - 256) * 2;
 
         if (high_index == 255 && paletteByteOffset == 0) {
             // CI8: full 256-entry palette spanning both halves
-            memcpy(mRdp->palette_staging[0], src, 256);
-            memcpy(mRdp->palette_staging[1], src + 256, 256);
+            copyPalette(mRdp->palette_staging[0], 256, 0);
+            copyPalette(mRdp->palette_staging[1], 256, 256);
             mRdp->palettes[0] = mRdp->palette_staging[0];
             mRdp->palettes[1] = mRdp->palette_staging[1];
             mRdp->palette_dram_addr[0] = src;
-            mRdp->palette_dram_addr[1] = src + 256;
+            mRdp->palette_dram_addr[1] = resource != nullptr ? TlutAddressToken(src, 256) : src + 256;
         } else if (paletteByteOffset < 256) {
             // Palettes 0-7 range
             uint32_t copyLen = (paletteByteOffset + byteCount <= 256) ? byteCount : (256 - paletteByteOffset);
-            memcpy(mRdp->palette_staging[0] + paletteByteOffset, src, copyLen);
+            copyPalette(mRdp->palette_staging[0] + paletteByteOffset, copyLen, 0);
             mRdp->palettes[0] = mRdp->palette_staging[0];
             mRdp->palette_dram_addr[0] = src;
         } else {
             // Palettes 8-15 range
             uint32_t offset = paletteByteOffset - 256;
             uint32_t copyLen = (offset + byteCount <= 256) ? byteCount : (256 - offset);
-            memcpy(mRdp->palette_staging[1] + offset, src, copyLen);
+            copyPalette(mRdp->palette_staging[1] + offset, copyLen, 0);
             mRdp->palettes[1] = mRdp->palette_staging[1];
             mRdp->palette_dram_addr[1] = src;
         }
