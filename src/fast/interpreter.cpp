@@ -28,6 +28,7 @@
 #include <string>
 
 #include "fast/interpreter.h"
+#include "fast/TextureCopy.h"
 #include "fast/TlutCopy.h"
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
@@ -903,6 +904,44 @@ void Interpreter::ImportTextureI4(int tile, bool importReplacement) {
     // A single line of pixels should not equal the entire image (height == 1 non-withstanding)
     if (fullImageLineSizeBytes == sizeBytes) {
         fullImageLineSizeBytes = width / 2;
+    }
+
+    // A display list can request more I4 bytes than an extracted resource owns
+    // (the magic meter requests 128 from a 64-byte resource). Retain the render
+    // dimensions/UV convention, but never decode adjacent allocation contents.
+    const int maxTextureSize = std::min(8192, mRapi->GetMaxTextureSize());
+    if (widthBytes == 0 || height == 0 || maxTextureSize <= 0 ||
+        widthBytes > static_cast<uint32_t>(maxTextureSize) / 2 ||
+        height > static_cast<uint32_t>(maxTextureSize)) {
+        SPDLOG_ERROR("ImportTextureI4: invalid dimensions {}x{} for tile {}", width, height, tile);
+        return;
+    }
+    std::vector<uint8_t> boundedSource;
+    if (!importReplacement && metadata->resource != nullptr) {
+        const auto& resource = metadata->resource;
+        TextureResourceSpan span{ resource->ImageData, resource->ImageDataSize, nullptr, 0,
+                                  resource->mImageBuffer != nullptr };
+        if (resource->mImageBuffer) {
+            span.ownedBufferData = reinterpret_cast<const uint8_t*>(resource->mImageBuffer->data());
+            span.ownedBufferBytes = resource->mImageBuffer->size();
+        }
+        const size_t availableBytes = AvailableTextureResourceBytes(addr, span);
+        const uint64_t requestedBytes = static_cast<uint64_t>(height - 1) * fullImageLineSizeBytes + widthBytes;
+        if (requestedBytes > availableBytes) {
+            boundedSource.resize(static_cast<size_t>(widthBytes) * height);
+            const auto copied = CopyTextureResourceRows(boundedSource.data(), boundedSource.size(), widthBytes, height,
+                                                        addr, fullImageLineSizeBytes, span);
+            if (!copied.valid) {
+                SPDLOG_ERROR("ImportTextureI4: invalid resource row layout for tile {}", tile);
+                return;
+            }
+            const auto initData = resource->GetInitData();
+            SPDLOG_WARN("ImportTextureI4: {} provides {} of {} requested source bytes; copied {} bytes, zero-filled {}",
+                        initData ? initData->Path : "<anonymous>", availableBytes, requestedBytes, copied.copiedBytes,
+                        boundedSource.size() - copied.copiedBytes);
+            addr = boundedSource.data();
+            fullImageLineSizeBytes = widthBytes;
+        }
     }
 
     uint32_t i = 0;
