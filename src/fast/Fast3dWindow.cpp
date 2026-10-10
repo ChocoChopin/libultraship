@@ -193,11 +193,15 @@ bool Fast3dWindow::IsFrameReady() {
     return mWindowManagerApi->IsFrameReady();
 }
 
-bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
+bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
+                                             bool preserveInputResponse) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
 
-    // Skip dropped frames
-    if (!wnd->IsFrameReady()) {
+    // Always service backend accounting. An input-responsive frame contains a
+    // new gameplay result, not a dispensable interpolation replay. Submit it
+    // even when the backend's refresh estimate recommends discarding it; normal
+    // Present pacing and GPU queue/backpressure still apply.
+    if (!wnd->IsFrameReady() && !preserveInputResponse) {
         return false;
     }
 
