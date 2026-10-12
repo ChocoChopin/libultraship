@@ -924,6 +924,18 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     QueryPerformanceCounter(&t);
     int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
                    FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
+    if (mMaxFrameLatency == 1) {
+        const int64_t interval = FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
+        const int64_t now = qpc_to_100ns(t.QuadPart);
+        if (mLowLatencyDeadline100ns != 0) next = mLowLatencyDeadline100ns + interval;
+        // Small overruns consume slack in the next interval instead of moving
+        // every subsequent deadline later. A stall does not create an unbounded
+        // catch-up burst. This changes pacing only, never skips a submitted pose.
+        if (now - next > interval) next = now;
+        mLowLatencyDeadline100ns = next;
+    } else {
+        mLowLatencyDeadline100ns = 0;
+    }
     int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
     if (left > 0) {
         LARGE_INTEGER li;
@@ -1012,6 +1024,7 @@ int GfxWindowBackendDXGI::GetTargetFps() {
 
 void GfxWindowBackendDXGI::SetTargetFps(int fps) {
     uint32_t old_fps = mTargetFps;
+    if (old_fps != fps) mLowLatencyDeadline100ns = 0;
     uint64_t t0 = mFrameTimeStamp / old_fps;
     uint32_t t1 = mFrameTimeStamp % old_fps;
     mTargetFps = fps;
