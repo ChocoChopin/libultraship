@@ -24,6 +24,7 @@
 #include "ship/config/ConsoleVariable.h"
 #include "ship/config/Config.h"
 #include "ship/Context.h"
+#include "ship/controller/physicaldevice/SDLControllerEventQueue.h"
 #include "ship/window/FileDropMgr.h"
 
 #include "libultraship/bridge/controllerbridge.h"
@@ -553,6 +554,7 @@ void GfxWindowBackendDXGI::Init(const char* game_name, const char* gfx_api_name,
 
     // Use high-resolution mTimer by default on Windows 10 (so that NtSetTimerResolution (...) hacks are not needed)
     mTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    mHighResolutionTimer = mTimer != nullptr;
     // Fallback to low resolution mTimer if unsupported by the OS
     if (mTimer == nullptr) {
         mTimer = CreateWaitableTimer(nullptr, FALSE, nullptr);
@@ -769,6 +771,7 @@ Ship::WindowRect GfxWindowBackendDXGI::GetPrimaryMonitorRect() {
 }
 
 void GfxWindowBackendDXGI::HandleEvents() {
+    Ship::DiscardNativeWindowControllerNotifications();
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
@@ -789,6 +792,16 @@ static uint64_t qpc_to_100ns(uint64_t qpc) {
 }
 
 bool GfxWindowBackendDXGI::IsFrameReady() {
+    if (mMaxFrameLatency == 1) {
+        // Every responsive frame carries new input and must be submitted. The
+        // legacy refresh estimator is only used to discard interpolation frames;
+        // its driver queries and history cannot improve this path's scheduling.
+        mFrameTimeStamp += FRAME_INTERVAL_NS_NUMERATOR;
+        mFrameStats.clear();
+        mPendingFrameStats.clear();
+        mDroppedFrame = false;
+        return true;
+    }
     DXGI_FRAME_STATISTICS stats;
     if (swap_chain->GetFrameStatistics(&stats) == S_OK &&
         (stats.SyncRefreshCount != 0 || stats.SyncQPCTime.QuadPart != 0ULL)) {
@@ -922,6 +935,9 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
 
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
+    mProfilePresent = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+        "gDeveloperTools.PlayerFrameProfile", 0) != 0;
+    if (mProfilePresent) mProfileBegin = t;
     int64_t next = qpc_to_100ns(mPreviousPresentTime.QuadPart) +
                    FRAME_INTERVAL_NS_NUMERATOR / (FRAME_INTERVAL_NS_DENOMINATOR * 100);
     if (mMaxFrameLatency == 1) {
@@ -936,7 +952,19 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     } else {
         mLowLatencyDeadline100ns = 0;
     }
-    int64_t left = next - qpc_to_100ns(t.QuadPart) - 15000UL;
+    // At the monitor rate, Present(1) plus the one-frame queue wait already
+    // provides pacing. Waiting again on a CPU deadline can miss the vblank it
+    // was trying to target. Keep CPU limiting for Vsync-off or a different rate.
+    if (mMaxFrameLatency == 1 && mVsyncEnabled && mWaitableObject != nullptr &&
+        std::abs(static_cast<double>(mTargetFps) - mDetectedHz) < 1.0) {
+        next = qpc_to_100ns(t.QuadPart);
+        mLowLatencyDeadline100ns = 0;
+    }
+    // A high-resolution wait does not need the old 1.5-ms spin margin on every
+    // responsive frame. Leave a short final guard without burning a large part
+    // of a CPU core while the renderer/audio/world also need it.
+    const int64_t spinGuard100ns = mMaxFrameLatency == 1 && mHighResolutionTimer ? 5000 : 15000;
+    int64_t left = next - qpc_to_100ns(t.QuadPart) - spinGuard100ns;
     if (left > 0) {
         LARGE_INTEGER li;
         li.QuadPart = -left;
@@ -953,24 +981,24 @@ void GfxWindowBackendDXGI::SwapBuffersBegin() {
     }
     QueryPerformanceCounter(&t);
     mPreviousPresentTime = t;
+    if (mProfilePresent) mProfileLimit = t;
     if (mTearingSupport && !mVsyncEnabled) {
         // 512: DXGI_PRESENT_ALLOW_TEARING - allows for true V-Sync off with flip model
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, DXGI_PRESENT_ALLOW_TEARING));
     } else {
         ThrowIfFailed(swap_chain->Present(mVsyncEnabled, 0));
     }
+    if (mProfilePresent) QueryPerformanceCounter(&mProfilePresentEnd);
 
     UINT this_present_id;
-    if (swap_chain->GetLastPresentCount(&this_present_id) == S_OK) {
+    if (mMaxFrameLatency != 1 && swap_chain->GetLastPresentCount(&this_present_id) == S_OK) {
         mPendingFrameStats.insert(std::make_pair(this_present_id, mVsyncEnabled));
     }
     mDroppedFrame = false;
 }
 
 void GfxWindowBackendDXGI::SwapBuffersEnd() {
-    LARGE_INTEGER t0, t1, t2;
-    QueryPerformanceCounter(&t0);
-    QueryPerformanceCounter(&t1);
+    LARGE_INTEGER waitBegin{}, waitEnd{}, t2{};
 
     if (mAppliedMaxFrameLatency > mMaxFrameLatency) {
         // If latency is decreased, you have to wait the same amout of times as the old latency was set to
@@ -992,6 +1020,7 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
         ApplyMaxFrameLatency(false);
     }
 
+    if (mProfilePresent) QueryPerformanceCounter(&waitBegin);
     if (!mDroppedFrame) {
         if (mWaitableObject != nullptr) {
             WaitForSingleObject(mWaitableObject, INFINITE);
@@ -999,17 +1028,36 @@ void GfxWindowBackendDXGI::SwapBuffersEnd() {
         // else TODO: maybe sleep until some estimated time the frame will be shown to reduce lag
     }
 
-    DXGI_FRAME_STATISTICS stats;
-    swap_chain->GetFrameStatistics(&stats);
+    if (mProfilePresent) QueryPerformanceCounter(&waitEnd);
+
+    // Only the legacy interpolation estimator consumes these statistics.
+    if (mMaxFrameLatency != 1) {
+        DXGI_FRAME_STATISTICS stats{};
+        mZeroLatency = swap_chain->GetFrameStatistics(&stats) == S_OK &&
+            !mPendingFrameStats.empty() && mPendingFrameStats.rbegin()->first == stats.PresentCount;
+    }
 
     QueryPerformanceCounter(&t2);
 
-    mZeroLatency = !mPendingFrameStats.empty() && mPendingFrameStats.rbegin()->first == stats.PresentCount;
+    if (mProfilePresent) {
+        static unsigned frames = 0;
+        static double worst = 0, limit = 0, present = 0, queue = 0, other = 0;
+        const double ms = 1000.0 / qpc_freq;
+        const double total = (t2.QuadPart - mProfileBegin.QuadPart) * ms;
+        if (total > worst) {
+            worst = total;
+            limit = (mProfileLimit.QuadPart - mProfileBegin.QuadPart) * ms;
+            present = (mProfilePresentEnd.QuadPart - mProfileLimit.QuadPart) * ms;
+            queue = (waitEnd.QuadPart - waitBegin.QuadPart) * ms;
+            other = (t2.QuadPart - mProfilePresentEnd.QuadPart) * ms - queue;
+        }
+        if (++frames == 120) {
+            SPDLOG_INFO("Worst DXGI swap {:.3}: limiter {:.3}, Present {:.3}, queue wait {:.3}, other {:.3} ms; focus {}, fullscreen {}, detected Hz {:.3}",
+                worst, limit, present, queue, other, mInFocus, mFullScreen, mDetectedHz);
+            frames = 0; worst = 0;
+        }
+    }
 
-    // printf(L"done %I64u gpu:%d wait:%d freed:%I64u frame:%u %u monitor:%u t:%I64u\n", (unsigned long
-    // long)(t0.QuadPart - qpc_init), (int)(t1.QuadPart - t0.QuadPart), (int)(t2.QuadPart - t0.QuadPart), (unsigned
-    // long long)(t2.QuadPart - qpc_init), mPendingFrameStats.rbegin()->first, stats.PresentCount,
-    // stats.SyncRefreshCount, (unsigned long long)(stats.SyncQPCTime.QuadPart - qpc_init));
 }
 
 double GfxWindowBackendDXGI::GetTime() {

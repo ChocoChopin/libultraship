@@ -1,4 +1,5 @@
 #pragma once
+#include "fast/VertexUploadCursor.h"
 
 #if defined(ENABLE_DX11) || defined(ENABLE_DX12)
 
@@ -126,6 +127,10 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     D3D_FEATURE_LEVEL mFeatureLevel;
 
   private:
+    Microsoft::WRL::ComPtr<ID3D11Query> mProfileDisjoint, mProfileGpuBegin, mProfileGpuEnd;
+    bool mProfileGpuPending = false, mProfileGpuActive = false;
+    unsigned mProfileGpuSamples = 0;
+    double mProfileGpuTotalMs = 0, mProfileGpuMaxMs = 0;
     void CreateDepthStencilObjects(uint32_t width, uint32_t height, uint32_t msaa_count, ID3D11DepthStencilView** view,
                                    ID3D11ShaderResourceView** srv);
 
@@ -139,6 +144,11 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
     Microsoft::WRL::ComPtr<ID3D11RasterizerState> mRasterizerState;
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> mDepthStencilState;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mVertexBuffer;
+    VertexUploadCursor mVertexUpload;
+    uint32_t mLastVertexBufferOffset = 0;
+    uint64_t mProfileUploadDraws = 0, mProfileUploadDiscards = 0;
+    uint32_t mProfileUploadFrames = 0;
+    bool mProfileUploads = false;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerFrameCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerDrawCb;
     Microsoft::WRL::ComPtr<ID3D11Buffer> mPerPrimDepthCb;

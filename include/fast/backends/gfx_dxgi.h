@@ -105,10 +105,13 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     uint32_t mMaxFrameLatency;
     uint32_t mAppliedMaxFrameLatency;
     HANDLE mTimer;
+    bool mHighResolutionTimer = false;
     bool mTearingSupport;
     bool mMousePressed[5];
     LARGE_INTEGER mPreviousPresentTime;
     int64_t mLowLatencyDeadline100ns = 0;
+    bool mProfilePresent = false;
+    LARGE_INTEGER mProfileBegin{}, mProfileLimit{}, mProfilePresentEnd{};
 
     RAWINPUTDEVICE mRawInputDevice[1];
     POINT mPrevMouseCursorPos;

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <vector>
 #include <cmath>
+#include <chrono>
 
 #include <map>
 #include <unordered_map>
@@ -33,6 +34,8 @@
 #include "ship/window/Window.h"
 
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/ShaderBytecodeCache.h"
+#include "fast/ShaderCompilationStats.h"
 #include "fast/interpreter.h"
 
 #include <prism/processor.h>
@@ -260,13 +263,15 @@ void GfxRenderingAPIDX11::Init() {
     ZeroMemory(&vertex_buffer_desc, sizeof(D3D11_BUFFER_DESC));
 
     vertex_buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
-    vertex_buffer_desc.ByteWidth = 256 * 32 * 3 * sizeof(float); // Same as buf_vbo size in gfx_pc
+    vertex_buffer_desc.ByteWidth = VertexUploadCursor::Capacity; // Same allocation size as before.
     vertex_buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     vertex_buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     vertex_buffer_desc.MiscFlags = 0;
 
     ThrowIfFailed(mDevice->CreateBuffer(&vertex_buffer_desc, nullptr, mVertexBuffer.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to create vertex buffer.");
+    mVertexUpload.Reset();
+    mLastVertexBufferStride = 0;
 
     // Create per-frame constant buffer
 
@@ -388,6 +393,9 @@ void GfxRenderingAPIDX11::ClearShaderCache() {
 }
 
 struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shader_id0, uint64_t shader_id1) {
+    const bool profile = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+        "gDeveloperTools.PlayerFrameProfile", 0) != 0;
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CCFeatures cc_features;
     gfx_cc_get_features(shader_id0, shader_id1, &cc_features);
 
@@ -400,39 +408,60 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     buf = shader.data();
     len = shader.size();
 
-    ComPtr<ID3DBlob> vs, ps;
-    ComPtr<ID3DBlob> error_blob;
-
 #if DEBUG_D3D
     UINT compile_flags = D3DCOMPILE_DEBUG;
 #else
     UINT compile_flags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
 #endif
-
-    HRESULT hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
-                             vs.GetAddressOf(), error_blob.GetAddressOf());
-
-    if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Vertex shader compilation failed");
-    }
-
-    hr = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0, ps.GetAddressOf(),
-                     error_blob.GetAddressOf());
-
-    if (FAILED(hr)) {
-        char* err = (char*)error_blob->GetBufferPointer();
-        MessageBoxA(mWindowBackend->GetWindowHandle(), err, "Error", MB_OK | MB_ICONERROR);
-        throw Ship::HResultException(hr, "Pixel shader compilation failed");
-    }
-
+    const auto cacheDirectory = Ship::Context::GetPathRelativeToAppDirectory("cache/dx11-shaders-v1");
+    const std::string identity = "D3DCompiler47/VSMain/vs_4_0/PSMain/ps_4_0/" +
+        std::to_string(compile_flags) + "\n" + shader;
+    ShaderBytecodeCache::Bytecode bytecode;
+    bool cached = ShaderBytecodeCache::Read(cacheDirectory, identity, bytecode);
+    auto compile = [&]() {
+        const auto compileStart = std::chrono::steady_clock::now();
+        ComPtr<ID3DBlob> vs, ps, error;
+        HRESULT result = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compile_flags, 0,
+                                    vs.GetAddressOf(), error.GetAddressOf());
+        if (FAILED(result)) {
+            const char* message = error ? static_cast<const char*>(error->GetBufferPointer()) : "Vertex shader compilation failed";
+            MessageBoxA(mWindowBackend->GetWindowHandle(), message, "Error", MB_OK | MB_ICONERROR);
+            throw Ship::HResultException(result, "Vertex shader compilation failed");
+        }
+        error.Reset();
+        result = mD3dCompile(buf, len, nullptr, nullptr, nullptr, "PSMain", "ps_4_0", compile_flags, 0,
+                            ps.GetAddressOf(), error.GetAddressOf());
+        if (FAILED(result)) {
+            const char* message = error ? static_cast<const char*>(error->GetBufferPointer()) : "Pixel shader compilation failed";
+            MessageBoxA(mWindowBackend->GetWindowHandle(), message, "Error", MB_OK | MB_ICONERROR);
+            throw Ship::HResultException(result, "Pixel shader compilation failed");
+        }
+        const auto* v = static_cast<const uint8_t*>(vs->GetBufferPointer());
+        const auto* p = static_cast<const uint8_t*>(ps->GetBufferPointer());
+        bytecode.vertex.assign(v, v + vs->GetBufferSize());
+        bytecode.pixel.assign(p, p + ps->GetBufferSize());
+        ++gShaderCompilationStats.compilations;
+        gShaderCompilationStats.milliseconds += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - compileStart).count();
+    };
+    if (!cached) compile();
     struct ShaderProgramD3D11* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
-
-    ThrowIfFailed(mDevice->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr,
-                                              prg->vertex_shader.GetAddressOf()));
-    ThrowIfFailed(mDevice->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr,
-                                             prg->pixel_shader.GetAddressOf()));
+    auto create = [&]() {
+        HRESULT result = mDevice->CreateVertexShader(bytecode.vertex.data(), bytecode.vertex.size(), nullptr,
+                                                     prg->vertex_shader.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(result)) result = mDevice->CreatePixelShader(bytecode.pixel.data(), bytecode.pixel.size(), nullptr,
+                                                                 prg->pixel_shader.ReleaseAndGetAddressOf());
+        return result;
+    };
+    HRESULT hr = create();
+    if (FAILED(hr) && cached) { // A driver-rejected cache entry is disposable.
+        cached = false;
+        compile();
+        hr = create();
+    }
+    ThrowIfFailed(hr);
+    if (cached) ++gShaderCompilationStats.cacheHits;
+    if (!cached) ShaderBytecodeCache::Write(cacheDirectory, identity, bytecode);
 
     // Input Layout
 
@@ -485,7 +514,7 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         ied[ied_index++] = { "INPUT", i, format, 0, D3D11_APPEND_ALIGNED_ELEMENT, D3D11_INPUT_PER_VERTEX_DATA, 0 };
     }
 
-    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, vs->GetBufferPointer(), vs->GetBufferSize(),
+    ThrowIfFailed(mDevice->CreateInputLayout(ied, ied_index, bytecode.vertex.data(), bytecode.vertex.size(),
                                              prg->input_layout.GetAddressOf()));
 
     // Blend state
@@ -523,6 +552,8 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
     prg->usedTextures[4] = cc_features.used_blend[0];
     prg->usedTextures[5] = cc_features.used_blend[1];
 
+    if (profile) SPDLOG_INFO("Shader creation {:016x}/{:016x}: cached {}, {:.3f} ms", shader_id0, shader_id1, cached,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     return (struct ShaderProgram*)(mShaderProgram = prg);
 }
 
@@ -779,19 +810,28 @@ void GfxRenderingAPIDX11::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, siz
         mPrimDepthDirty = false;
     }
 
-    // Set vertex buffer data
+    // Append small draw batches instead of renaming all 96 KiB on every draw.
+    // NO_OVERWRITE touches only an unused range; wrapping DISCARD preserves any
+    // earlier GPU reads. Each draw is still issued immediately, with no new
+    // frame queue, deferred command list, or retained gameplay pose.
+    const size_t uploadBytes = buf_vbo_len * sizeof(float);
+    ThrowIfFailed(uploadBytes <= VertexUploadCursor::Capacity ? S_OK : E_INVALIDARG);
+    const auto upload = mVertexUpload.Reserve(static_cast<uint32_t>(uploadBytes));
 
     D3D11_MAPPED_SUBRESOURCE ms;
     ZeroMemory(&ms, sizeof(D3D11_MAPPED_SUBRESOURCE));
-    mContext->Map(mVertexBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms);
-    memcpy(ms.pData, buf_vbo, buf_vbo_len * sizeof(float));
+    ThrowIfFailed(mContext->Map(mVertexBuffer.Get(), 0,
+        upload.discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE, 0, &ms));
+    memcpy(static_cast<uint8_t*>(ms.pData) + upload.offset, buf_vbo, uploadBytes);
     mContext->Unmap(mVertexBuffer.Get(), 0);
+    if (mProfileUploads) { ++mProfileUploadDraws; mProfileUploadDiscards += upload.discard; }
 
     uint32_t stride = mShaderProgram->numFloats * sizeof(float);
-    uint32_t offset = 0;
+    uint32_t offset = upload.offset;
 
-    if (mLastVertexBufferStride != stride) {
+    if (mLastVertexBufferStride != stride || mLastVertexBufferOffset != offset) {
         mLastVertexBufferStride = stride;
+        mLastVertexBufferOffset = offset;
         mContext->IASetVertexBuffers(0, 1, mVertexBuffer.GetAddressOf(), &stride, &offset);
     }
 
@@ -820,6 +860,44 @@ void GfxRenderingAPIDX11::OnResize() {
 }
 
 void GfxRenderingAPIDX11::StartFrame() {
+    // Opt-in, bounded profiler: never wait or flush to retrieve timing data.
+    const int profileMode = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+        "gDeveloperTools.PlayerFrameProfile", 0);
+    const bool profile = profileMode == 1;
+    mProfileUploads = profileMode != 0;
+    if (profile && !mProfileDisjoint) {
+        D3D11_QUERY_DESC desc{ D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+        if (SUCCEEDED(mDevice->CreateQuery(&desc, &mProfileDisjoint))) {
+            desc.Query = D3D11_QUERY_TIMESTAMP;
+            mDevice->CreateQuery(&desc, &mProfileGpuBegin);
+            mDevice->CreateQuery(&desc, &mProfileGpuEnd);
+        }
+    }
+    if (mProfileGpuPending) {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT data{};
+        UINT64 begin = 0, end = 0;
+        if (mContext->GetData(mProfileDisjoint.Get(), &data, sizeof(data), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            mContext->GetData(mProfileGpuBegin.Get(), &begin, sizeof(begin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            mContext->GetData(mProfileGpuEnd.Get(), &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+            mProfileGpuPending = false;
+            if (!data.Disjoint && data.Frequency && end >= begin) {
+                const double ms = (end - begin) * 1000.0 / data.Frequency;
+                mProfileGpuTotalMs += ms;
+                mProfileGpuMaxMs = std::max(mProfileGpuMaxMs, ms);
+                if (++mProfileGpuSamples == 120) {
+                    SPDLOG_INFO("GPU pipeline span ms: average {:.3}, max {:.3}", mProfileGpuTotalMs / 120, mProfileGpuMaxMs);
+                    mProfileGpuSamples = 0; mProfileGpuTotalMs = mProfileGpuMaxMs = 0;
+                }
+            }
+        }
+    }
+    // Both frame setup and display-list execution call StartFrame. Open the
+    // timestamp interval only once, and keep it until the matching EndFrame.
+    if (profile && mProfileDisjoint && mProfileGpuBegin && mProfileGpuEnd && !mProfileGpuPending && !mProfileGpuActive) {
+        mProfileGpuActive = true;
+        mContext->Begin(mProfileDisjoint.Get());
+        mContext->End(mProfileGpuBegin.Get());
+    }
     // Set per-frame constant buffer
     ID3D11Buffer* buffers[3] = { mPerFrameCb.Get(), mPerDrawCb.Get(), mPerPrimDepthCb.Get() };
     mContext->PSSetConstantBuffers(0, 3, buffers);
@@ -832,6 +910,19 @@ void GfxRenderingAPIDX11::StartFrame() {
 }
 
 void GfxRenderingAPIDX11::EndFrame() {
+    // Next frame starts with DISCARD; a prior frame's GPU reads remain intact.
+    mVertexUpload.Reset();
+    if (mProfileUploads && ++mProfileUploadFrames == 120) {
+        SPDLOG_INFO("Vertex uploads per frame: {:.1f} batches, {:.1f} discard maps (96-KiB allocation)",
+            mProfileUploadDraws / 120.0, mProfileUploadDiscards / 120.0);
+        mProfileUploadFrames = 0; mProfileUploadDraws = mProfileUploadDiscards = 0;
+    }
+    if (mProfileGpuActive) {
+        mContext->End(mProfileGpuEnd.Get());
+        mContext->End(mProfileDisjoint.Get());
+        mProfileGpuActive = false;
+        mProfileGpuPending = true;
+    }
     mContext->Flush();
 }
 

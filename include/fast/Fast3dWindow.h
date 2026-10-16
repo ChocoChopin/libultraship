@@ -82,7 +82,7 @@ class Fast3dWindow : public Ship::Window {
     void SetRendererUCode(UcodeHandlers ucode);
     void EnableSRGBMode();
     bool DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
-                                   bool preserveInputResponse = false);
+                                   bool preserveInputResponse = false, double* presentTime = nullptr);
 
     std::weak_ptr<Interpreter> GetInterpreterWeak() const;
 

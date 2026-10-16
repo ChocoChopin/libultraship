@@ -16,6 +16,12 @@
 #include "fast/Fast3dGui.h"
 
 #include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <iterator>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace Fast {
 
@@ -194,8 +200,24 @@ bool Fast3dWindow::IsFrameReady() {
 }
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
-                                             bool preserveInputResponse) {
+                                             bool preserveInputResponse, double* presentTime) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
+    const bool profile = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+        "gDeveloperTools.PlayerFrameProfile", 0) != 0;
+    using Clock = std::chrono::steady_clock;
+    auto stamp = profile ? Clock::now() : Clock::time_point{};
+    const auto frameStart = stamp;
+    static auto previousEnd = Clock::time_point{};
+    static double timings[5]{};
+    static unsigned timingFrames = 0;
+    double frameTimings[5]{};
+    static double worstInterval = 0, worstOutside = 0, worstPhases[5]{};
+    static uint64_t commandCycles = 0, worstCommandCycles = 0;
+    auto sample = [&](unsigned slot) {
+        if (profile) { const auto now = Clock::now();
+            frameTimings[slot] = std::chrono::duration<double, std::milli>(now - stamp).count();
+            timings[slot] += frameTimings[slot]; stamp = now; }
+    };
 
     // Always service backend accounting. An input-responsive frame contains a
     // new gameplay result, not a dispensable interpolation replay. Submit it
@@ -204,6 +226,7 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     if (!wnd->IsFrameReady() && !preserveInputResponse) {
         return false;
     }
+    sample(0);
 
     auto gui = wnd->GetGui();
     // Setup mouse state manager
@@ -212,12 +235,53 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     gui->StartDraw();
     // Setup game framebuffers to match available window space
     mInterpreter->StartFrame();
+    sample(1);
     // Execute the games gfx commands
+    // The responsive Player path replays a world list six times per tick. Reuse
+    // resource resolution only inside this synchronous draw, never across a
+    // gameplay update, asset reload, or frame-arena lifetime.
+    if (preserveInputResponse) mInterpreter->SetResolvedResourceCacheEnabled(true);
+    uint64_t cyclesBegin = 0, cyclesEnd = 0;
+#ifdef _WIN32
+    if (profile) QueryThreadCycleTime(GetCurrentThread(), &cyclesBegin);
+#endif
     mInterpreter->Run(commands, mtxReplacements);
+    if (preserveInputResponse) mInterpreter->SetResolvedResourceCacheEnabled(false);
+#ifdef _WIN32
+    if (profile) QueryThreadCycleTime(GetCurrentThread(), &cyclesEnd);
+#endif
+    commandCycles += cyclesEnd - cyclesBegin;
+    sample(2);
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
+    sample(3);
     // Finalize swap buffers
-    mInterpreter->EndFrame();
+    mInterpreter->EndFrame(presentTime);
+    sample(4);
+    if (profile) {
+        if (previousEnd != Clock::time_point{}) {
+            const double interval = std::chrono::duration<double, std::milli>(stamp - previousEnd).count();
+            if (interval > worstInterval) {
+                worstInterval = interval;
+                worstOutside = std::chrono::duration<double, std::milli>(frameStart - previousEnd).count();
+                worstCommandCycles = cyclesEnd - cyclesBegin;
+                std::copy(std::begin(frameTimings), std::end(frameTimings), worstPhases);
+            }
+        }
+        previousEnd = stamp;
+    }
+    if (profile && ++timingFrames == 120) {
+        SPDLOG_INFO("Render timings ms/frame: ready {:.3f}, setup {:.3f}, commands {:.3f}, gui {:.3f}, swap {:.3f}",
+            timings[0]/120, timings[1]/120, timings[2]/120, timings[3]/120, timings[4]/120);
+        SPDLOG_INFO("Worst render interval {:.3}: outside {:.3}, ready {:.3}, setup {:.3}, commands {:.3}, gui {:.3}, swap {:.3} ms",
+            worstInterval, worstOutside, worstPhases[0], worstPhases[1], worstPhases[2], worstPhases[3], worstPhases[4]);
+        SPDLOG_INFO("Command CPU million cycles: average {:.3}, worst-interval {:.3}",
+            commandCycles / 120000000.0, worstCommandCycles / 1000000.0);
+        for (double& timing : timings) timing = 0;
+        timingFrames = 0;
+        worstInterval = worstOutside = 0;
+        commandCycles = worstCommandCycles = 0;
+    }
 
     return true;
 }

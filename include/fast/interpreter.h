@@ -385,7 +385,8 @@ class Interpreter {
     void StartFrame();
     void RunGuiOnly();
     void Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_replacements);
-    void EndFrame();
+    // Optional submission timestamp, before waiting for the next frame's queue slot.
+    void EndFrame(double* presentTime = nullptr);
     void HandleWindowEvents();
     bool IsFrameReady();
     bool ViewportMatchesRendererResolution();
