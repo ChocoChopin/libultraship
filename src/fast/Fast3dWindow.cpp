@@ -200,7 +200,8 @@ bool Fast3dWindow::IsFrameReady() {
 }
 
 bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
-                                             bool preserveInputResponse, double* presentTime) {
+                                             bool preserveInputResponse, double* presentTime,
+                                             void (*beforePresent)()) {
     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
     const bool profile = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
         "gDeveloperTools.PlayerFrameProfile", 0) != 0;
@@ -255,6 +256,9 @@ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordere
     // Renders the game frame buffer to the final window and finishes the GUI
     gui->EndDraw();
     sample(3);
+    // Synchronous visual feedback can use this frame's completed draw commands
+    // before Present. No callback or result is retained across draws.
+    if (beforePresent) beforePresent();
     // Finalize swap buffers
     mInterpreter->EndFrame(presentTime);
     sample(4);
